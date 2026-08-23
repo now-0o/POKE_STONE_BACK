@@ -15,6 +15,13 @@ export const SaveData = sequelize.define('SaveData', {
     type: DataTypes.JSON,
     allowNull: false,
   },
+  // 여러 기기가 같은 계정을 동시에 열어도 오래된 세이브가 최신 세이브를
+  // 덮어쓰지 못하도록 사용하는 낙관적 잠금 버전.
+  revision: {
+    type: DataTypes.INTEGER,
+    allowNull: false,
+    defaultValue: 0,
+  },
 }, {
   indexes: [{ unique: true, fields: ['userId'] }], // 유저당 세이브 1개
 });
