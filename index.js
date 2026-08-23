@@ -3,6 +3,7 @@ import express from 'express';
 import cors from 'cors';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
+import { DataTypes } from 'sequelize';
 import { sequelize } from './db.js';
 import { User } from './models/User.js';
 import { SaveData } from './models/SaveData.js';
@@ -38,6 +39,32 @@ function auth(req, res, next) {
   }
 }
 
+function sendSaveConflict(res, save) {
+  return res.status(409).json({
+    error: 'save_conflict',
+    message: '다른 기기에서 더 최신 세이브가 저장되었습니다.',
+    save: save ? save.data : null,
+    revision: save ? save.revision : 0,
+  });
+}
+
+// 기존 운영 DB에도 revision 컬럼이 자동으로 한 번 추가되도록 한다.
+// sequelize.sync()만으로는 이미 존재하는 테이블에 새 컬럼이 생기지 않는다.
+async function ensureSaveRevisionColumn() {
+  const queryInterface = sequelize.getQueryInterface();
+  const tableName = SaveData.getTableName();
+  const columns = await queryInterface.describeTable(tableName);
+
+  if (!columns.revision) {
+    await queryInterface.addColumn(tableName, 'revision', {
+      type: DataTypes.INTEGER,
+      allowNull: false,
+      defaultValue: 0,
+    });
+    console.log('✅ SaveData.revision 컬럼 추가 완료');
+  }
+}
+
 app.get('/health', (req, res) => res.json({ ok: true }));
 
 // ── 회원가입 ──
@@ -56,7 +83,7 @@ app.post('/api/register', async (req, res) => {
     const passwordHash = await bcrypt.hash(password, 10);
     const user = await User.create({ username, passwordHash });
     const token = signToken(user);
-    res.json({ token, username: user.username });
+    res.json({ token, username: user.username, save: null, revision: 0 });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'server_error' });
@@ -74,7 +101,12 @@ app.post('/api/login', async (req, res) => {
 
     const token = signToken(user);
     const save = await SaveData.findOne({ where: { UserId: user.id } });
-    res.json({ token, username: user.username, save: save ? save.data : null });
+    res.json({
+      token,
+      username: user.username,
+      save: save ? save.data : null,
+      revision: save ? save.revision : 0,
+    });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'server_error' });
@@ -85,37 +117,90 @@ app.post('/api/login', async (req, res) => {
 app.get('/api/save', auth, async (req, res) => {
   try {
     const save = await SaveData.findOne({ where: { UserId: req.user.uid } });
-    res.json({ save: save ? save.data : null });
+    res.json({
+      save: save ? save.data : null,
+      revision: save ? save.revision : 0,
+    });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'server_error' });
   }
 });
 
-// ── 세이브 저장 (덮어쓰기 upsert) ──
+// ── 세이브 저장 (revision 기반 낙관적 잠금) ──
 app.put('/api/save', auth, async (req, res) => {
   try {
-    const { data } = req.body || {};
-    if (!data || typeof data !== 'object') return res.status(400).json({ error: 'bad_data' });
-
-    const [row, created] = await SaveData.findOrCreate({
-      where: { UserId: req.user.uid },
-      defaults: { data, UserId: req.user.uid },
-    });
-    if (!created) {
-      row.data = data;
-      await row.save();
+    const { data, revision } = req.body || {};
+    if (!data || typeof data !== 'object') {
+      return res.status(400).json({ error: 'bad_data' });
     }
-    res.json({ ok: true });
+    if (!Number.isInteger(revision) || revision < 0) {
+      return res.status(400).json({
+        error: 'bad_revision',
+        message: '세이브 버전 정보가 없습니다. 페이지를 새로고침해주세요.',
+      });
+    }
+
+    const row = await SaveData.findOne({ where: { UserId: req.user.uid } });
+
+    // 아직 서버 세이브가 없는 신규 계정.
+    if (!row) {
+      if (revision !== 0) return sendSaveConflict(res, null);
+
+      try {
+        const created = await SaveData.create({
+          data,
+          revision: 1,
+          UserId: req.user.uid,
+        });
+        return res.json({ ok: true, revision: created.revision });
+      } catch (e) {
+        // 두 기기가 신규 세이브를 동시에 만들었다면 unique 제약에 걸린 쪽은
+        // 최신 서버 세이브를 받아 충돌 처리한다.
+        if (e?.name === 'SequelizeUniqueConstraintError') {
+          const latest = await SaveData.findOne({ where: { UserId: req.user.uid } });
+          return sendSaveConflict(res, latest);
+        }
+        throw e;
+      }
+    }
+
+    if (row.revision !== revision) {
+      return sendSaveConflict(res, row);
+    }
+
+    const nextRevision = revision + 1;
+    const [updated] = await SaveData.update(
+      { data, revision: nextRevision },
+      {
+        where: {
+          id: row.id,
+          UserId: req.user.uid,
+          revision,
+        },
+      },
+    );
+
+    // 조회 직후 다른 기기가 먼저 저장했어도 조건부 UPDATE가 0건이 되어
+    // 오래된 데이터가 최신 데이터를 덮어쓰지 못한다.
+    if (updated !== 1) {
+      const latest = await SaveData.findOne({ where: { UserId: req.user.uid } });
+      return sendSaveConflict(res, latest);
+    }
+
+    return res.json({ ok: true, revision: nextRevision });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'server_error' });
   }
 });
 
-sequelize.sync().then(() => {
-  app.listen(PORT, () => console.log(`✅ poke-stone-server on :${PORT}`));
-}).catch((e) => {
-  console.error('DB 연결/동기화 실패:', e.message);
-  process.exit(1);
-});
+sequelize.sync()
+  .then(() => ensureSaveRevisionColumn())
+  .then(() => {
+    app.listen(PORT, () => console.log(`✅ poke-stone-server on :${PORT}`));
+  })
+  .catch((e) => {
+    console.error('DB 연결/동기화 실패:', e.message);
+    process.exit(1);
+  });
