@@ -3,6 +3,7 @@ import express from 'express';
 import cors from 'cors';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
+import crypto from 'node:crypto';
 import { DataTypes } from 'sequelize';
 import { sequelize } from './db.js';
 import { User } from './models/User.js';
@@ -11,6 +12,7 @@ import { SaveData } from './models/SaveData.js';
 const app = express();
 const PORT = process.env.PORT || 4000;
 const JWT_SECRET = process.env.JWT_SECRET;
+const ADMIN_CODE = process.env.ADMIN_CODE || 'stonemaster';
 if (!JWT_SECRET) {
   console.error('JWT_SECRET이 .env에 없습니다. 서버를 시작할 수 없어요.');
   process.exit(1);
@@ -19,12 +21,24 @@ if (!JWT_SECRET) {
 // Netlify redirect(/api/*)를 통해서만 들어오므로 CORS는 넓게 열어도
 // 실제로는 프록시를 거친 same-origin 요청이라 문제 없음.
 app.use(cors());
-app.use(express.json({ limit: '256kb' })); // 세이브 데이터는 작아서 넉넉히
+app.use(express.json({ limit: '256kb' }));
 
 const USERNAME_RE = /^[a-zA-Z0-9_]{3,20}$/;
+const CARD_ID_RE = /^[a-zA-Z0-9_-]{1,64}$/;
+const MATCHMAKING_IDLE_MS = 60_000;
+
+// 안정성 테스트 단계의 랜덤 매칭은 단일 EC2 프로세스 메모리에서 관리한다.
+// 서버 재시작 시 큐/매치는 초기화된다. 이후 다중 인스턴스/랭크전 단계에서 Redis로 이전한다.
+const matchmakingQueue = [];
+const activeMatches = new Map();
+const matchByUser = new Map();
 
 function signToken(user) {
-  return jwt.sign({ uid: user.id, username: user.username }, JWT_SECRET, { expiresIn: '30d' });
+  return jwt.sign(
+    { uid: user.id, username: user.username },
+    JWT_SECRET,
+    { expiresIn: '30d' },
+  );
 }
 
 function auth(req, res, next) {
@@ -39,6 +53,25 @@ function auth(req, res, next) {
   }
 }
 
+async function adminOnly(req, res, next) {
+  try {
+    const user = await User.findByPk(req.user.uid, {
+      attributes: ['id', 'username', 'isAdmin'],
+    });
+    if (!user || !user.isAdmin) {
+      return res.status(403).json({
+        error: 'admin_only',
+        message: '온라인 배틀은 안정성 테스트 중입니다. 관리자 계정만 이용할 수 있습니다.',
+      });
+    }
+    req.dbUser = user;
+    next();
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: 'server_error' });
+  }
+}
+
 function sendSaveConflict(res, save) {
   return res.status(409).json({
     error: 'save_conflict',
@@ -48,8 +81,6 @@ function sendSaveConflict(res, save) {
   });
 }
 
-// 기존 운영 DB에도 revision 컬럼이 자동으로 한 번 추가되도록 한다.
-// sequelize.sync()만으로는 이미 존재하는 테이블에 새 컬럼이 생기지 않는다.
 async function ensureSaveRevisionColumn() {
   const queryInterface = sequelize.getQueryInterface();
   const tableName = SaveData.getTableName();
@@ -62,6 +93,123 @@ async function ensureSaveRevisionColumn() {
       defaultValue: 0,
     });
     console.log('✅ SaveData.revision 컬럼 추가 완료');
+  }
+}
+
+async function ensureUserAdminColumn() {
+  const queryInterface = sequelize.getQueryInterface();
+  const tableName = User.getTableName();
+  const columns = await queryInterface.describeTable(tableName);
+
+  if (!columns.isAdmin) {
+    await queryInterface.addColumn(tableName, 'isAdmin', {
+      type: DataTypes.BOOLEAN,
+      allowNull: false,
+      defaultValue: false,
+    });
+    console.log('✅ User.isAdmin 컬럼 추가 완료');
+  }
+}
+
+function sanitizeDeckSnapshot(deck, deckShiny = {}) {
+  if (!Array.isArray(deck) || deck.length !== 30) return null;
+  if (!deck.every((cardId) => typeof cardId === 'string' && CARD_ID_RE.test(cardId))) {
+    return null;
+  }
+
+  const shiny = {};
+  if (deckShiny && typeof deckShiny === 'object' && !Array.isArray(deckShiny)) {
+    const deckCounts = deck.reduce((acc, cardId) => {
+      acc[cardId] = (acc[cardId] || 0) + 1;
+      return acc;
+    }, {});
+    for (const [cardId, rawCount] of Object.entries(deckShiny)) {
+      if (!CARD_ID_RE.test(cardId) || !deckCounts[cardId]) continue;
+      const count = Number(rawCount);
+      if (!Number.isInteger(count) || count <= 0) continue;
+      shiny[cardId] = Math.min(count, deckCounts[cardId]);
+    }
+  }
+
+  return { deck: [...deck], deckShiny: shiny };
+}
+
+function removeQueuedUser(uid) {
+  const index = matchmakingQueue.findIndex((entry) => entry.uid === uid);
+  if (index >= 0) matchmakingQueue.splice(index, 1);
+}
+
+function pruneStaleQueue() {
+  const cutoff = Date.now() - MATCHMAKING_IDLE_MS;
+  for (let i = matchmakingQueue.length - 1; i >= 0; i -= 1) {
+    if (matchmakingQueue[i].lastSeenAt < cutoff) matchmakingQueue.splice(i, 1);
+  }
+}
+
+function currentMatchForUser(uid) {
+  const matchId = matchByUser.get(uid);
+  if (!matchId) return null;
+  const match = activeMatches.get(matchId);
+  if (!match) {
+    matchByUser.delete(uid);
+    return null;
+  }
+  return match;
+}
+
+function matchmakingStatus(uid) {
+  const match = currentMatchForUser(uid);
+  if (match) {
+    const me = match.players.find((player) => player.uid === uid);
+    const opponent = match.players.find((player) => player.uid !== uid);
+    return {
+      status: 'matched',
+      matchId: match.id,
+      seat: me?.seat || null,
+      goesFirst: match.firstUid === uid,
+      opponent: opponent ? { username: opponent.username } : null,
+      matchedAt: match.matchedAt,
+    };
+  }
+
+  const queueIndex = matchmakingQueue.findIndex((entry) => entry.uid === uid);
+  if (queueIndex >= 0) {
+    matchmakingQueue[queueIndex].lastSeenAt = Date.now();
+    return {
+      status: 'searching',
+      joinedAt: matchmakingQueue[queueIndex].joinedAt,
+      queuePosition: queueIndex + 1,
+    };
+  }
+
+  return { status: 'idle' };
+}
+
+function createMatch(firstEntry, secondEntry) {
+  const id = crypto.randomUUID();
+  const firstUid = Math.random() < 0.5 ? firstEntry.uid : secondEntry.uid;
+  const match = {
+    id,
+    matchedAt: Date.now(),
+    firstUid,
+    players: [
+      { ...firstEntry, seat: 'A' },
+      { ...secondEntry, seat: 'B' },
+    ],
+  };
+  activeMatches.set(id, match);
+  matchByUser.set(firstEntry.uid, id);
+  matchByUser.set(secondEntry.uid, id);
+  return match;
+}
+
+function leaveMatchmaking(uid) {
+  removeQueuedUser(uid);
+  const match = currentMatchForUser(uid);
+  if (!match) return;
+  activeMatches.delete(match.id);
+  for (const player of match.players) {
+    if (matchByUser.get(player.uid) === match.id) matchByUser.delete(player.uid);
   }
 }
 
@@ -83,7 +231,13 @@ app.post('/api/register', async (req, res) => {
     const passwordHash = await bcrypt.hash(password, 10);
     const user = await User.create({ username, passwordHash });
     const token = signToken(user);
-    res.json({ token, username: user.username, save: null, revision: 0 });
+    res.json({
+      token,
+      username: user.username,
+      isAdmin: !!user.isAdmin,
+      save: null,
+      revision: 0,
+    });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'server_error' });
@@ -104,6 +258,7 @@ app.post('/api/login', async (req, res) => {
     res.json({
       token,
       username: user.username,
+      isAdmin: !!user.isAdmin,
       save: save ? save.data : null,
       revision: save ? save.revision : 0,
     });
@@ -113,13 +268,38 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
+// stonemaster를 입력한 로그인 계정만 서버 관리자 플래그를 얻는다.
+app.post('/api/admin/unlock', auth, async (req, res) => {
+  try {
+    const { code } = req.body || {};
+    if (code !== ADMIN_CODE) {
+      return res.status(403).json({
+        error: 'invalid_admin_code',
+        message: '관리자 코드가 올바르지 않습니다.',
+      });
+    }
+
+    const user = await User.findByPk(req.user.uid);
+    if (!user) return res.status(401).json({ error: 'invalid_token' });
+    if (!user.isAdmin) await user.update({ isAdmin: true });
+    return res.json({ ok: true, isAdmin: true });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: 'server_error' });
+  }
+});
+
 // ── 세이브 불러오기 ──
 app.get('/api/save', auth, async (req, res) => {
   try {
-    const save = await SaveData.findOne({ where: { UserId: req.user.uid } });
+    const [save, user] = await Promise.all([
+      SaveData.findOne({ where: { UserId: req.user.uid } }),
+      User.findByPk(req.user.uid, { attributes: ['isAdmin'] }),
+    ]);
     res.json({
       save: save ? save.data : null,
       revision: save ? save.revision : 0,
+      isAdmin: !!user?.isAdmin,
     });
   } catch (e) {
     console.error(e);
@@ -143,7 +323,6 @@ app.put('/api/save', auth, async (req, res) => {
 
     const row = await SaveData.findOne({ where: { UserId: req.user.uid } });
 
-    // 아직 서버 세이브가 없는 신규 계정.
     if (!row) {
       if (revision !== 0) return sendSaveConflict(res, null);
 
@@ -155,8 +334,6 @@ app.put('/api/save', auth, async (req, res) => {
         });
         return res.json({ ok: true, revision: created.revision });
       } catch (e) {
-        // 두 기기가 신규 세이브를 동시에 만들었다면 unique 제약에 걸린 쪽은
-        // 최신 서버 세이브를 받아 충돌 처리한다.
         if (e?.name === 'SequelizeUniqueConstraintError') {
           const latest = await SaveData.findOne({ where: { UserId: req.user.uid } });
           return sendSaveConflict(res, latest);
@@ -181,8 +358,6 @@ app.put('/api/save', auth, async (req, res) => {
       },
     );
 
-    // 조회 직후 다른 기기가 먼저 저장했어도 조건부 UPDATE가 0건이 되어
-    // 오래된 데이터가 최신 데이터를 덮어쓰지 못한다.
     if (updated !== 1) {
       const latest = await SaveData.findOne({ where: { UserId: req.user.uid } });
       return sendSaveConflict(res, latest);
@@ -195,8 +370,70 @@ app.put('/api/save', auth, async (req, res) => {
   }
 });
 
+// ── 관리자 전용 랜덤 매칭 ──
+app.post('/api/matchmaking/join', auth, adminOnly, async (req, res) => {
+  try {
+    pruneStaleQueue();
+    const snapshot = sanitizeDeckSnapshot(req.body?.deck, req.body?.deckShiny);
+    if (!snapshot) {
+      return res.status(400).json({
+        error: 'invalid_deck',
+        message: '온라인 배틀은 30장 덱이 필요합니다.',
+      });
+    }
+
+    const uid = req.dbUser.id;
+    const existingMatch = currentMatchForUser(uid);
+    if (existingMatch) return res.json(matchmakingStatus(uid));
+
+    const queued = matchmakingQueue.find((entry) => entry.uid === uid);
+    if (queued) {
+      queued.deck = snapshot.deck;
+      queued.deckShiny = snapshot.deckShiny;
+      queued.lastSeenAt = Date.now();
+      return res.json(matchmakingStatus(uid));
+    }
+
+    const opponentIndex = matchmakingQueue.findIndex((entry) => entry.uid !== uid);
+    if (opponentIndex >= 0) {
+      const [opponent] = matchmakingQueue.splice(opponentIndex, 1);
+      createMatch(opponent, {
+        uid,
+        username: req.dbUser.username,
+        ...snapshot,
+        joinedAt: Date.now(),
+        lastSeenAt: Date.now(),
+      });
+      return res.json(matchmakingStatus(uid));
+    }
+
+    matchmakingQueue.push({
+      uid,
+      username: req.dbUser.username,
+      ...snapshot,
+      joinedAt: Date.now(),
+      lastSeenAt: Date.now(),
+    });
+    return res.json(matchmakingStatus(uid));
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: 'server_error' });
+  }
+});
+
+app.get('/api/matchmaking/status', auth, adminOnly, async (req, res) => {
+  pruneStaleQueue();
+  return res.json(matchmakingStatus(req.dbUser.id));
+});
+
+app.post('/api/matchmaking/leave', auth, adminOnly, async (req, res) => {
+  leaveMatchmaking(req.dbUser.id);
+  return res.json({ ok: true, status: 'idle' });
+});
+
 sequelize.sync()
   .then(() => ensureSaveRevisionColumn())
+  .then(() => ensureUserAdminColumn())
   .then(() => {
     app.listen(PORT, () => console.log(`✅ poke-stone-server on :${PORT}`));
   })
