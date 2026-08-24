@@ -18,17 +18,25 @@ if (!JWT_SECRET) {
   process.exit(1);
 }
 
-// Netlify redirect(/api/*)를 통해서만 들어오므로 CORS는 넓게 열어도
-// 실제로는 프록시를 거친 same-origin 요청이라 문제 없음.
 app.use(cors());
-app.use(express.json({ limit: '256kb' }));
+app.use(express.json({ limit: '1mb' }));
 
 const USERNAME_RE = /^[a-zA-Z0-9_]{3,20}$/;
 const CARD_ID_RE = /^[a-zA-Z0-9_-]{1,64}$/;
 const MATCHMAKING_IDLE_MS = 60_000;
+const ONLINE_COMMAND_TYPES = new Set([
+  'mulligan',
+  'play',
+  'attack',
+  'end_turn',
+  'resolve_pending',
+  'resolve_choose',
+  'surrender',
+]);
 
-// 안정성 테스트 단계의 랜덤 매칭은 단일 EC2 프로세스 메모리에서 관리한다.
-// 서버 재시작 시 큐/매치는 초기화된다. 이후 다중 인스턴스/랭크전 단계에서 Redis로 이전한다.
+// 안정성 테스트 단계의 랜덤 매칭/전투방은 단일 EC2 프로세스 메모리에서 관리한다.
+// 서버 재시작 시 큐/매치는 초기화된다. 이후 Redis + 서버 권위 엔진으로 이전할 수 있게
+// command/stateRevision 프로토콜을 분리해 둔다.
 const matchmakingQueue = [];
 const activeMatches = new Map();
 const matchByUser = new Map();
@@ -157,11 +165,29 @@ function currentMatchForUser(uid) {
   return match;
 }
 
+function playerForUser(match, uid) {
+  return match?.players?.find((player) => player.uid === uid) || null;
+}
+
+function opponentForUser(match, uid) {
+  return match?.players?.find((player) => player.uid !== uid) || null;
+}
+
+function canonicalSide(match, uid) {
+  const player = playerForUser(match, uid);
+  if (!player) return null;
+  return player.seat === 'A' ? 'player' : 'enemy';
+}
+
+function firstSideForMatch(match) {
+  return canonicalSide(match, match.firstUid) || 'player';
+}
+
 function matchmakingStatus(uid) {
   const match = currentMatchForUser(uid);
   if (match) {
-    const me = match.players.find((player) => player.uid === uid);
-    const opponent = match.players.find((player) => player.uid !== uid);
+    const me = playerForUser(match, uid);
+    const opponent = opponentForUser(match, uid);
     return {
       status: 'matched',
       matchId: match.id,
@@ -169,6 +195,8 @@ function matchmakingStatus(uid) {
       goesFirst: match.firstUid === uid,
       opponent: opponent ? { username: opponent.username } : null,
       matchedAt: match.matchedAt,
+      phase: match.phase,
+      stateRevision: match.stateRevision,
     };
   }
 
@@ -188,14 +216,25 @@ function matchmakingStatus(uid) {
 function createMatch(firstEntry, secondEntry) {
   const id = crypto.randomUUID();
   const firstUid = Math.random() < 0.5 ? firstEntry.uid : secondEntry.uid;
+  const players = [
+    { ...firstEntry, seat: 'A' },
+    { ...secondEntry, seat: 'B' },
+  ];
   const match = {
     id,
     matchedAt: Date.now(),
+    lastActivityAt: Date.now(),
     firstUid,
-    players: [
-      { ...firstEntry, seat: 'A' },
-      { ...secondEntry, seat: 'B' },
-    ],
+    hostUid: players[0].uid,
+    seed: crypto.randomBytes(12).toString('hex'),
+    players,
+    phase: 'waiting_host',
+    state: null,
+    stateRevision: 0,
+    commandSeq: 0,
+    pendingCommand: null,
+    lastCommand: null,
+    mulliganDone: Object.fromEntries(players.map((player) => [player.uid, false])),
   };
   activeMatches.set(id, match);
   matchByUser.set(firstEntry.uid, id);
@@ -213,9 +252,131 @@ function leaveMatchmaking(uid) {
   }
 }
 
+function matchFromRequest(req, res) {
+  const match = activeMatches.get(req.params.matchId);
+  if (!match || !playerForUser(match, req.dbUser.id)) {
+    res.status(404).json({
+      error: 'match_not_found',
+      message: '온라인 배틀 세션을 찾을 수 없습니다.',
+    });
+    return null;
+  }
+  match.lastActivityAt = Date.now();
+  return match;
+}
+
+function cloneJson(value) {
+  if (value == null) return value;
+  return JSON.parse(JSON.stringify(value));
+}
+
+function clientGameState(match, uid) {
+  if (!match.state) return null;
+  const game = cloneJson(match.state);
+  if (uid === match.hostUid) return game;
+
+  const mine = canonicalSide(match, uid);
+  const hidden = mine === 'player' ? 'enemy' : 'player';
+  const hiddenPlayer = game.players?.[hidden];
+  if (hiddenPlayer) {
+    const deckCount = Array.isArray(hiddenPlayer.deck) ? hiddenPlayer.deck.length : 0;
+    const hand = Array.isArray(hiddenPlayer.hand) ? hiddenPlayer.hand : [];
+    hiddenPlayer.deck = Array.from({ length: deckCount }, () => null);
+    hiddenPlayer.hand = hand.map((entry) => ({
+      uid: entry?.uid || null,
+      hidden: true,
+    }));
+    hiddenPlayer._shinyDeckRemaining = {};
+  }
+
+  if (game.pendingChoose?.side === hidden) {
+    game.pendingChoose = null;
+  }
+  return game;
+}
+
+function roomStatePayload(match, uid) {
+  const me = playerForUser(match, uid);
+  const opponent = opponentForUser(match, uid);
+  return {
+    status: 'active',
+    matchId: match.id,
+    phase: match.phase,
+    revision: match.stateRevision,
+    host: match.hostUid === uid,
+    mySide: canonicalSide(match, uid),
+    firstSide: firstSideForMatch(match),
+    opponent: opponent ? { username: opponent.username } : null,
+    me: me ? { username: me.username, seat: me.seat } : null,
+    mulligan: {
+      me: !!match.mulliganDone[uid],
+      opponent: opponent ? !!match.mulliganDone[opponent.uid] : false,
+    },
+    lastCommand:
+      match.lastCommand?.uid === uid
+        ? match.lastCommand
+        : null,
+    game: clientGameState(match, uid),
+  };
+}
+
+function normalizeOnlineCommand(body) {
+  const type = typeof body?.type === 'string' ? body.type : '';
+  if (!ONLINE_COMMAND_TYPES.has(type)) return null;
+
+  if (type === 'mulligan') {
+    const raw = Array.isArray(body.cardUids) ? body.cardUids : [];
+    const cardUids = [...new Set(raw)]
+      .filter((uid) => typeof uid === 'string' && uid.length <= 128)
+      .slice(0, 10);
+    return { type, cardUids };
+  }
+
+  if (type === 'play') {
+    if (typeof body.handUid !== 'string' || body.handUid.length > 128) return null;
+    const command = { type, handUid: body.handUid };
+    if (typeof body.targetUid === 'string' && body.targetUid.length <= 128) {
+      command.targetUid = body.targetUid;
+    }
+    if (Number.isInteger(body.fieldIndex) && body.fieldIndex >= 0 && body.fieldIndex <= 6) {
+      command.fieldIndex = body.fieldIndex;
+    }
+    return command;
+  }
+
+  if (type === 'attack') {
+    if (
+      typeof body.attackerUid !== 'string' || body.attackerUid.length > 128 ||
+      typeof body.targetUid !== 'string' || body.targetUid.length > 128
+    ) return null;
+    return { type, attackerUid: body.attackerUid, targetUid: body.targetUid };
+  }
+
+  if (type === 'resolve_pending') {
+    if (typeof body.targetUid !== 'string' || body.targetUid.length > 128) return null;
+    return { type, targetUid: body.targetUid };
+  }
+
+  if (type === 'resolve_choose') {
+    const value = body.value;
+    if (!['string', 'number'].includes(typeof value)) return null;
+    if (typeof value === 'string' && value.length > 128) return null;
+    return { type, value };
+  }
+
+  return { type };
+}
+
+function validateSubmittedGame(game) {
+  if (!game || typeof game !== 'object' || Array.isArray(game)) return false;
+  if (!game.players?.player || !game.players?.enemy) return false;
+  if (!['player', 'enemy'].includes(game.turn)) return false;
+  if (!Array.isArray(game.log)) return false;
+  return true;
+}
+
 app.get('/health', (req, res) => res.json({ ok: true }));
 
-// ── 회원가입 ──
 app.post('/api/register', async (req, res) => {
   try {
     const { username, password } = req.body || {};
@@ -244,7 +405,6 @@ app.post('/api/register', async (req, res) => {
   }
 });
 
-// ── 로그인 ──
 app.post('/api/login', async (req, res) => {
   try {
     const { username, password } = req.body || {};
@@ -268,7 +428,6 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
-// stonemaster를 입력한 로그인 계정만 서버 관리자 플래그를 얻는다.
 app.post('/api/admin/unlock', auth, async (req, res) => {
   try {
     const { code } = req.body || {};
@@ -289,7 +448,6 @@ app.post('/api/admin/unlock', auth, async (req, res) => {
   }
 });
 
-// ── 세이브 불러오기 ──
 app.get('/api/save', auth, async (req, res) => {
   try {
     const [save, user] = await Promise.all([
@@ -307,7 +465,6 @@ app.get('/api/save', auth, async (req, res) => {
   }
 });
 
-// ── 세이브 저장 (revision 기반 낙관적 잠금) ──
 app.put('/api/save', auth, async (req, res) => {
   try {
     const { data, revision } = req.body || {};
@@ -370,7 +527,6 @@ app.put('/api/save', auth, async (req, res) => {
   }
 });
 
-// ── 관리자 전용 랜덤 매칭 ──
 app.post('/api/matchmaking/join', auth, adminOnly, async (req, res) => {
   try {
     pruneStaleQueue();
@@ -429,6 +585,184 @@ app.get('/api/matchmaking/status', auth, adminOnly, async (req, res) => {
 app.post('/api/matchmaking/leave', auth, adminOnly, async (req, res) => {
   leaveMatchmaking(req.dbUser.id);
   return res.json({ ok: true, status: 'idle' });
+});
+
+// ── 관리자 테스트용 온라인 배틀방 ──
+app.get('/api/online/match/:matchId/bootstrap', auth, adminOnly, async (req, res) => {
+  const match = matchFromRequest(req, res);
+  if (!match) return;
+  const uid = req.dbUser.id;
+  const me = playerForUser(match, uid);
+  const opponent = opponentForUser(match, uid);
+  const host = match.hostUid === uid;
+
+  return res.json({
+    matchId: match.id,
+    seat: me?.seat || null,
+    host,
+    mySide: canonicalSide(match, uid),
+    firstSide: firstSideForMatch(match),
+    seed: match.seed,
+    phase: match.phase,
+    stateRevision: match.stateRevision,
+    me: me ? { username: me.username } : null,
+    opponent: opponent ? { username: opponent.username } : null,
+    ...(host
+      ? {
+          playerDeck: {
+            username: match.players[0].username,
+            deck: match.players[0].deck,
+            deckShiny: match.players[0].deckShiny,
+          },
+          enemyDeck: {
+            username: match.players[1].username,
+            deck: match.players[1].deck,
+            deckShiny: match.players[1].deckShiny,
+          },
+        }
+      : {}),
+  });
+});
+
+app.post('/api/online/match/:matchId/initialize', auth, adminOnly, async (req, res) => {
+  const match = matchFromRequest(req, res);
+  if (!match) return;
+  if (match.hostUid !== req.dbUser.id) {
+    return res.status(403).json({ error: 'host_only', message: '전투 초기화는 호스트만 할 수 있습니다.' });
+  }
+  if (match.state) return res.json(roomStatePayload(match, req.dbUser.id));
+  if (!validateSubmittedGame(req.body?.game)) {
+    return res.status(400).json({ error: 'invalid_game_state' });
+  }
+  if (req.body.game.firstSide !== firstSideForMatch(match)) {
+    return res.status(409).json({ error: 'first_side_mismatch' });
+  }
+
+  match.state = cloneJson(req.body.game);
+  match.stateRevision = 1;
+  match.phase = 'mulligan';
+  match.lastActivityAt = Date.now();
+  return res.json(roomStatePayload(match, req.dbUser.id));
+});
+
+app.get('/api/online/match/:matchId/state', auth, adminOnly, async (req, res) => {
+  const match = matchFromRequest(req, res);
+  if (!match) return;
+  return res.json(roomStatePayload(match, req.dbUser.id));
+});
+
+app.get('/api/online/match/:matchId/host', auth, adminOnly, async (req, res) => {
+  const match = matchFromRequest(req, res);
+  if (!match) return;
+  if (match.hostUid !== req.dbUser.id) {
+    return res.status(403).json({ error: 'host_only' });
+  }
+
+  return res.json({
+    ...roomStatePayload(match, req.dbUser.id),
+    game: cloneJson(match.state),
+    pendingCommand: match.pendingCommand,
+  });
+});
+
+app.post('/api/online/match/:matchId/command', auth, adminOnly, async (req, res) => {
+  const match = matchFromRequest(req, res);
+  if (!match) return;
+  const uid = req.dbUser.id;
+  const side = canonicalSide(match, uid);
+  const command = normalizeOnlineCommand(req.body);
+  if (!command) {
+    return res.status(400).json({ error: 'invalid_command' });
+  }
+  if (!match.state) {
+    return res.status(409).json({ error: 'room_not_ready', message: '전투방 초기화를 기다리는 중입니다.' });
+  }
+  if (match.pendingCommand) {
+    return res.status(409).json({ error: 'command_busy', message: '이전 행동을 처리 중입니다.' });
+  }
+  if (match.phase === 'finished') {
+    return res.status(409).json({ error: 'match_finished' });
+  }
+
+  if (match.phase === 'mulligan') {
+    if (command.type !== 'mulligan') {
+      return res.status(409).json({ error: 'mulligan_required' });
+    }
+    if (match.mulliganDone[uid]) {
+      return res.status(409).json({ error: 'mulligan_already_done' });
+    }
+  } else if (match.phase === 'battle') {
+    if (command.type !== 'surrender' && match.state.turn !== side) {
+      return res.status(409).json({ error: 'not_your_turn', message: '상대 턴입니다.' });
+    }
+  } else {
+    return res.status(409).json({ error: 'room_not_ready' });
+  }
+
+  const id = ++match.commandSeq;
+  match.pendingCommand = {
+    id,
+    uid,
+    side,
+    payload: command,
+    createdAt: Date.now(),
+    baseRevision: match.stateRevision,
+  };
+  match.lastActivityAt = Date.now();
+  return res.json({ ok: true, commandId: id, revision: match.stateRevision });
+});
+
+app.post('/api/online/match/:matchId/host/commit', auth, adminOnly, async (req, res) => {
+  const match = matchFromRequest(req, res);
+  if (!match) return;
+  if (match.hostUid !== req.dbUser.id) {
+    return res.status(403).json({ error: 'host_only' });
+  }
+
+  const pending = match.pendingCommand;
+  if (!pending || pending.id !== req.body?.commandId) {
+    return res.status(409).json({ error: 'command_mismatch' });
+  }
+  if (req.body?.baseRevision !== match.stateRevision || pending.baseRevision !== match.stateRevision) {
+    return res.status(409).json({ error: 'revision_mismatch', revision: match.stateRevision });
+  }
+  if (!validateSubmittedGame(req.body?.game)) {
+    return res.status(400).json({ error: 'invalid_game_state' });
+  }
+
+  const ok = req.body?.ok !== false;
+  const error = ok ? null : String(req.body?.error || 'invalid_action').slice(0, 160);
+  match.state = cloneJson(req.body.game);
+  match.stateRevision += 1;
+  match.lastCommand = {
+    id: pending.id,
+    uid: pending.uid,
+    ok,
+    error,
+    revision: match.stateRevision,
+  };
+
+  if (ok && pending.payload.type === 'mulligan') {
+    match.mulliganDone[pending.uid] = true;
+    if (match.players.every((player) => match.mulliganDone[player.uid])) {
+      match.phase = 'battle';
+    }
+  }
+
+  if (ok && pending.payload.type === 'surrender') {
+    match.phase = 'finished';
+  }
+  if (match.state?.winner) {
+    match.phase = 'finished';
+  }
+
+  match.pendingCommand = null;
+  match.lastActivityAt = Date.now();
+  return res.json({
+    ok: true,
+    phase: match.phase,
+    revision: match.stateRevision,
+  });
 });
 
 sequelize.sync()
