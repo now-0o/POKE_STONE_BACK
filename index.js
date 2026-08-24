@@ -28,6 +28,8 @@ const ONLINE_COMMAND_TYPES = new Set([
   'mulligan',
   'play',
   'attack',
+  'attack_obstacle',
+  'discard_redraw',
   'end_turn',
   'resolve_pending',
   'resolve_choose',
@@ -350,6 +352,19 @@ function normalizeOnlineCommand(body) {
       typeof body.targetUid !== 'string' || body.targetUid.length > 128
     ) return null;
     return { type, attackerUid: body.attackerUid, targetUid: body.targetUid };
+  }
+
+  if (type === 'attack_obstacle') {
+    if (
+      typeof body.attackerUid !== 'string' || body.attackerUid.length > 128 ||
+      typeof body.obstacleId !== 'string' || body.obstacleId.length > 128
+    ) return null;
+    return { type, attackerUid: body.attackerUid, obstacleId: body.obstacleId };
+  }
+
+  if (type === 'discard_redraw') {
+    if (typeof body.handUid !== 'string' || body.handUid.length > 128) return null;
+    return { type, handUid: body.handUid };
   }
 
   if (type === 'resolve_pending') {
