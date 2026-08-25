@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
+import compression from 'compression';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import crypto from 'node:crypto';
@@ -19,11 +20,17 @@ if (!JWT_SECRET) {
 }
 
 app.use(cors());
+app.use(compression({ threshold: 1024, level: 4 }));
 app.use(express.json({ limit: '1mb' }));
 
 const USERNAME_RE = /^[a-zA-Z0-9_]{3,20}$/;
 const CARD_ID_RE = /^[a-zA-Z0-9_-]{1,64}$/;
 const MATCHMAKING_IDLE_MS = 60_000;
+const ONLINE_PLAYER_IDLE_MS = 90_000;
+const ONLINE_RATE_REFILL_PER_SECOND = 35;
+const ONLINE_RATE_BURST = 70;
+const ONLINE_RATE_BUCKET_IDLE_MS = 5 * 60_000;
+const ONLINE_RUNTIME_SWEEP_MS = 15_000;
 const ONLINE_COMMAND_TYPES = new Set([
   'mulligan',
   'play',
@@ -42,6 +49,7 @@ const ONLINE_COMMAND_TYPES = new Set([
 const matchmakingQueue = [];
 const activeMatches = new Map();
 const matchByUser = new Map();
+const onlineRateBuckets = new Map();
 
 function signToken(user) {
   return jwt.sign(
@@ -63,20 +71,48 @@ function auth(req, res, next) {
   }
 }
 
-async function onlineUser(req, res, next) {
-  try {
-    const user = await User.findByPk(req.user.uid, {
-      attributes: ['id', 'username'],
-    });
-    if (!user) {
-      return res.status(401).json({ error: 'invalid_token' });
-    }
-    req.dbUser = user;
-    next();
-  } catch (e) {
-    console.error(e);
-    return res.status(500).json({ error: 'server_error' });
+function onlineUser(req, res, next) {
+  const uid = req.user?.uid;
+  const username = req.user?.username;
+  if (uid == null || typeof username !== 'string' || !username) {
+    return res.status(401).json({ error: 'invalid_token' });
   }
+  req.dbUser = { id: uid, username };
+  next();
+}
+
+function onlineRateLimit(req, res, next) {
+  const key = String(req.user?.uid ?? req.ip ?? 'unknown');
+  const now = Date.now();
+  const previous = onlineRateBuckets.get(key);
+  const elapsed = previous ? Math.max(0, now - previous.updatedAt) : 0;
+  const tokens = previous
+    ? Math.min(
+        ONLINE_RATE_BURST,
+        previous.tokens + (elapsed * ONLINE_RATE_REFILL_PER_SECOND) / 1000,
+      )
+    : ONLINE_RATE_BURST;
+
+  if (tokens < 1) {
+    if (previous) {
+      previous.updatedAt = now;
+      previous.lastSeenAt = now;
+      previous.tokens = tokens;
+    }
+    res.set('Retry-After', '1');
+    return res.status(429).json({
+      error: 'rate_limited',
+      message: '온라인 요청이 너무 빠릅니다. 잠시 후 다시 시도해주세요.',
+    });
+  }
+
+  onlineRateBuckets.set(key, {
+    tokens: tokens - 1,
+    updatedAt: now,
+    lastSeenAt: now,
+  });
+  res.set('Cache-Control', 'private, no-store, max-age=0');
+  next();
 }
 
 function sendSaveConflict(res, save) {
@@ -153,6 +189,31 @@ function pruneStaleQueue() {
   }
 }
 
+function destroyMatch(match) {
+  if (!match) return;
+  activeMatches.delete(match.id);
+  for (const player of match.players || []) {
+    if (matchByUser.get(player.uid) === match.id) matchByUser.delete(player.uid);
+  }
+}
+
+function pruneStaleMatches() {
+  const cutoff = Date.now() - ONLINE_PLAYER_IDLE_MS;
+  for (const match of activeMatches.values()) {
+    const playerExpired = (match.players || []).some(
+      (player) => (player.lastSeenAt || match.matchedAt || 0) < cutoff,
+    );
+    if (playerExpired) destroyMatch(match);
+  }
+}
+
+function pruneOnlineRateBuckets() {
+  const cutoff = Date.now() - ONLINE_RATE_BUCKET_IDLE_MS;
+  for (const [key, bucket] of onlineRateBuckets.entries()) {
+    if ((bucket.lastSeenAt || 0) < cutoff) onlineRateBuckets.delete(key);
+  }
+}
+
 function currentMatchForUser(uid) {
   const matchId = matchByUser.get(uid);
   if (!matchId) return null;
@@ -187,6 +248,9 @@ function matchmakingStatus(uid) {
   if (match) {
     const me = playerForUser(match, uid);
     const opponent = opponentForUser(match, uid);
+    const now = Date.now();
+    if (me) me.lastSeenAt = now;
+    match.lastActivityAt = now;
     return {
       status: 'matched',
       matchId: match.id,
@@ -215,14 +279,15 @@ function matchmakingStatus(uid) {
 function createMatch(firstEntry, secondEntry) {
   const id = crypto.randomUUID();
   const firstUid = Math.random() < 0.5 ? firstEntry.uid : secondEntry.uid;
+  const now = Date.now();
   const players = [
-    { ...firstEntry, seat: 'A' },
-    { ...secondEntry, seat: 'B' },
+    { ...firstEntry, seat: 'A', lastSeenAt: now },
+    { ...secondEntry, seat: 'B', lastSeenAt: now },
   ];
   const match = {
     id,
-    matchedAt: Date.now(),
-    lastActivityAt: Date.now(),
+    matchedAt: now,
+    lastActivityAt: now,
     firstUid,
     hostUid: players[0].uid,
     seed: crypto.randomBytes(12).toString('hex'),
@@ -245,10 +310,7 @@ function leaveMatchmaking(uid) {
   removeQueuedUser(uid);
   const match = currentMatchForUser(uid);
   if (!match) return;
-  activeMatches.delete(match.id);
-  for (const player of match.players) {
-    if (matchByUser.get(player.uid) === match.id) matchByUser.delete(player.uid);
-  }
+  destroyMatch(match);
 }
 
 function matchFromRequest(req, res) {
@@ -260,7 +322,10 @@ function matchFromRequest(req, res) {
     });
     return null;
   }
-  match.lastActivityAt = Date.now();
+  const now = Date.now();
+  const player = playerForUser(match, req.dbUser.id);
+  if (player) player.lastSeenAt = now;
+  match.lastActivityAt = now;
   return match;
 }
 
@@ -291,6 +356,9 @@ function clientGameState(match, uid) {
   if (game.pendingChoose?.side === hidden) {
     game.pendingChoose = null;
   }
+  if (Array.isArray(game.log) && game.log.length > 16) {
+    game.log = game.log.slice(-16);
+  }
   return game;
 }
 
@@ -316,6 +384,35 @@ function roomStatePayload(match, uid) {
         ? match.lastCommand
         : null,
     game: clientGameState(match, uid),
+  };
+}
+
+function onlinePollResponse(req, match, host = false) {
+  const revision = Number.parseInt(String(req.query?.revision ?? ''), 10);
+  if (!Number.isInteger(revision) || revision !== match.stateRevision) return null;
+
+  if (!host) {
+    return {
+      unchanged: true,
+      revision: match.stateRevision,
+    };
+  }
+
+  if (typeof req.query?.pending !== 'string') return null;
+  const currentPending =
+    match.pendingCommand?.id == null ? '' : String(match.pendingCommand.id);
+
+  if (req.query.pending === currentPending) {
+    return {
+      unchanged: true,
+      revision: match.stateRevision,
+    };
+  }
+
+  return {
+    delta: true,
+    revision: match.stateRevision,
+    pendingCommand: match.pendingCommand,
   };
 }
 
@@ -386,6 +483,13 @@ function validateSubmittedGame(game) {
   if (!Array.isArray(game.log)) return false;
   return true;
 }
+
+const onlineRuntimeSweep = setInterval(() => {
+  pruneStaleQueue();
+  pruneStaleMatches();
+  pruneOnlineRateBuckets();
+}, ONLINE_RUNTIME_SWEEP_MS);
+onlineRuntimeSweep.unref?.();
 
 app.get('/health', (req, res) => res.json({ ok: true }));
 
@@ -539,7 +643,14 @@ app.put('/api/save', auth, async (req, res) => {
   }
 });
 
-app.post('/api/matchmaking/join', auth, onlineUser, async (req, res) => {
+app.use(
+  ['/api/matchmaking', '/api/online'],
+  auth,
+  onlineUser,
+  onlineRateLimit,
+);
+
+app.post('/api/matchmaking/join', async (req, res) => {
   try {
     pruneStaleQueue();
     const snapshot = sanitizeDeckSnapshot(req.body?.deck, req.body?.deckShiny);
@@ -589,18 +700,18 @@ app.post('/api/matchmaking/join', auth, onlineUser, async (req, res) => {
   }
 });
 
-app.get('/api/matchmaking/status', auth, onlineUser, async (req, res) => {
+app.get('/api/matchmaking/status', async (req, res) => {
   pruneStaleQueue();
   return res.json(matchmakingStatus(req.dbUser.id));
 });
 
-app.post('/api/matchmaking/leave', auth, onlineUser, async (req, res) => {
+app.post('/api/matchmaking/leave', async (req, res) => {
   leaveMatchmaking(req.dbUser.id);
   return res.json({ ok: true, status: 'idle' });
 });
 
 // ── 온라인 배틀방 ──
-app.get('/api/online/match/:matchId/bootstrap', auth, onlineUser, async (req, res) => {
+app.get('/api/online/match/:matchId/bootstrap', async (req, res) => {
   const match = matchFromRequest(req, res);
   if (!match) return;
   const uid = req.dbUser.id;
@@ -636,7 +747,7 @@ app.get('/api/online/match/:matchId/bootstrap', auth, onlineUser, async (req, re
   });
 });
 
-app.post('/api/online/match/:matchId/initialize', auth, onlineUser, async (req, res) => {
+app.post('/api/online/match/:matchId/initialize', async (req, res) => {
   const match = matchFromRequest(req, res);
   if (!match) return;
   if (match.hostUid !== req.dbUser.id) {
@@ -657,27 +768,31 @@ app.post('/api/online/match/:matchId/initialize', auth, onlineUser, async (req, 
   return res.json(roomStatePayload(match, req.dbUser.id));
 });
 
-app.get('/api/online/match/:matchId/state', auth, onlineUser, async (req, res) => {
+app.get('/api/online/match/:matchId/state', async (req, res) => {
   const match = matchFromRequest(req, res);
   if (!match) return;
+  const compact = onlinePollResponse(req, match, false);
+  if (compact) return res.json(compact);
   return res.json(roomStatePayload(match, req.dbUser.id));
 });
 
-app.get('/api/online/match/:matchId/host', auth, onlineUser, async (req, res) => {
+app.get('/api/online/match/:matchId/host', async (req, res) => {
   const match = matchFromRequest(req, res);
   if (!match) return;
   if (match.hostUid !== req.dbUser.id) {
     return res.status(403).json({ error: 'host_only' });
   }
 
+  const compact = onlinePollResponse(req, match, true);
+  if (compact) return res.json(compact);
+
   return res.json({
     ...roomStatePayload(match, req.dbUser.id),
-    game: cloneJson(match.state),
     pendingCommand: match.pendingCommand,
   });
 });
 
-app.post('/api/online/match/:matchId/command', auth, onlineUser, async (req, res) => {
+app.post('/api/online/match/:matchId/command', async (req, res) => {
   const match = matchFromRequest(req, res);
   if (!match) return;
   const uid = req.dbUser.id;
@@ -724,7 +839,7 @@ app.post('/api/online/match/:matchId/command', auth, onlineUser, async (req, res
   return res.json({ ok: true, commandId: id, revision: match.stateRevision });
 });
 
-app.post('/api/online/match/:matchId/host/commit', auth, onlineUser, async (req, res) => {
+app.post('/api/online/match/:matchId/host/commit', async (req, res) => {
   const match = matchFromRequest(req, res);
   if (!match) return;
   if (match.hostUid !== req.dbUser.id) {
