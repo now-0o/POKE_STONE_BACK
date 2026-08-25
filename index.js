@@ -25,7 +25,12 @@ app.use(express.json({ limit: '1mb' }));
 
 const USERNAME_RE = /^[a-zA-Z0-9_]{3,20}$/;
 const CARD_ID_RE = /^[a-zA-Z0-9_-]{1,64}$/;
+const FRIENDLY_CODE_RE = /^[A-Z2-9]{6}$/;
+const FRIENDLY_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const MATCHMAKING_IDLE_MS = 60_000;
+const FRIENDLY_ROOM_IDLE_MS = 10 * 60_000;
+const FRIENDLY_GUEST_IDLE_MS = 90_000;
+const FRIENDLY_STARTED_KEEP_MS = 2 * 60_000;
 const ONLINE_PLAYER_IDLE_MS = 90_000;
 const ONLINE_RATE_REFILL_PER_SECOND = 35;
 const ONLINE_RATE_BURST = 70;
@@ -43,10 +48,11 @@ const ONLINE_COMMAND_TYPES = new Set([
   'surrender',
 ]);
 
-// 랜덤 매칭/전투방은 단일 EC2 프로세스 메모리에서 관리한다.
-// 서버 재시작 시 큐/매치는 초기화된다. 이후 Redis + 서버 권위 엔진으로 이전할 수 있게
-// command/stateRevision 프로토콜을 분리해 둔다.
+// 랜덤 매칭/친선전 대기실/전투방은 단일 EC2 프로세스 메모리에서 관리한다.
+// 서버 재시작 시 큐/대기실/매치는 초기화된다.
 const matchmakingQueue = [];
+const friendlyRooms = new Map();
+const friendlyRoomByUser = new Map();
 const activeMatches = new Map();
 const matchByUser = new Map();
 const onlineRateBuckets = new Map();
@@ -186,6 +192,123 @@ function pruneStaleQueue() {
   const cutoff = Date.now() - MATCHMAKING_IDLE_MS;
   for (let i = matchmakingQueue.length - 1; i >= 0; i -= 1) {
     if (matchmakingQueue[i].lastSeenAt < cutoff) matchmakingQueue.splice(i, 1);
+  }
+}
+
+function generateFriendlyCode() {
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    let code = '';
+    for (let i = 0; i < 6; i += 1) {
+      code += FRIENDLY_CODE_ALPHABET[
+        crypto.randomInt(0, FRIENDLY_CODE_ALPHABET.length)
+      ];
+    }
+    if (!friendlyRooms.has(code)) return code;
+  }
+  return crypto.randomBytes(4).toString('hex').slice(0, 6).toUpperCase();
+}
+
+function friendlyParticipant(room, uid) {
+  if (!room) return null;
+  if (room.host?.uid === uid) return room.host;
+  if (room.guest?.uid === uid) return room.guest;
+  return null;
+}
+
+function currentFriendlyRoomForUser(uid) {
+  const code = friendlyRoomByUser.get(uid);
+  if (!code) return null;
+  const room = friendlyRooms.get(code);
+  if (!room || !friendlyParticipant(room, uid)) {
+    friendlyRoomByUser.delete(uid);
+    return null;
+  }
+  return room;
+}
+
+function destroyFriendlyRoom(room) {
+  if (!room) return;
+  friendlyRooms.delete(room.code);
+  for (const participant of [room.host, room.guest]) {
+    if (participant && friendlyRoomByUser.get(participant.uid) === room.code) {
+      friendlyRoomByUser.delete(participant.uid);
+    }
+  }
+}
+
+function leaveFriendlyRoom(uid) {
+  const room = currentFriendlyRoomForUser(uid);
+  if (!room) return;
+
+  if (room.host?.uid === uid) {
+    destroyFriendlyRoom(room);
+    return;
+  }
+
+  if (room.guest?.uid === uid) {
+    friendlyRoomByUser.delete(uid);
+    room.guest = null;
+    room.host.ready = false;
+    room.status = 'waiting';
+    room.lastActivityAt = Date.now();
+  }
+}
+
+function friendlyRoomPayload(room, uid) {
+  const me = friendlyParticipant(room, uid);
+  if (!me) return null;
+  const opponent = room.host?.uid === uid ? room.guest : room.host;
+  const now = Date.now();
+  me.lastSeenAt = now;
+  room.lastActivityAt = now;
+
+  return {
+    status: room.status,
+    code: room.code,
+    host: room.host.uid === uid,
+    me: {
+      username: me.username,
+      ready: !!me.ready,
+    },
+    opponent: opponent
+      ? {
+          username: opponent.username,
+          ready: !!opponent.ready,
+        }
+      : null,
+    canStart:
+      room.host.uid === uid &&
+      !!room.host.ready &&
+      !!room.guest?.ready &&
+      room.status === 'waiting',
+    matchId: room.status === 'started' ? room.matchId : null,
+  };
+}
+
+function pruneStaleFriendlyRooms() {
+  const now = Date.now();
+  for (const room of friendlyRooms.values()) {
+    if (room.status === 'started') {
+      if (now - (room.startedAt || room.lastActivityAt || 0) > FRIENDLY_STARTED_KEEP_MS) {
+        destroyFriendlyRoom(room);
+      }
+      continue;
+    }
+
+    if (now - (room.lastActivityAt || room.createdAt || 0) > FRIENDLY_ROOM_IDLE_MS) {
+      destroyFriendlyRoom(room);
+      continue;
+    }
+
+    if (
+      room.guest &&
+      now - (room.guest.lastSeenAt || room.guest.joinedAt || 0) > FRIENDLY_GUEST_IDLE_MS
+    ) {
+      friendlyRoomByUser.delete(room.guest.uid);
+      room.guest = null;
+      room.host.ready = false;
+      room.lastActivityAt = now;
+    }
   }
 }
 
@@ -486,6 +609,7 @@ function validateSubmittedGame(game) {
 
 const onlineRuntimeSweep = setInterval(() => {
   pruneStaleQueue();
+  pruneStaleFriendlyRooms();
   pruneStaleMatches();
   pruneOnlineRateBuckets();
 }, ONLINE_RUNTIME_SWEEP_MS);
@@ -644,7 +768,7 @@ app.put('/api/save', auth, async (req, res) => {
 });
 
 app.use(
-  ['/api/matchmaking', '/api/online'],
+  ['/api/matchmaking', '/api/friendly', '/api/online'],
   auth,
   onlineUser,
   onlineRateLimit,
@@ -653,6 +777,7 @@ app.use(
 app.post('/api/matchmaking/join', async (req, res) => {
   try {
     pruneStaleQueue();
+    pruneStaleFriendlyRooms();
     const snapshot = sanitizeDeckSnapshot(req.body?.deck, req.body?.deckShiny);
     if (!snapshot) {
       return res.status(400).json({
@@ -662,6 +787,12 @@ app.post('/api/matchmaking/join', async (req, res) => {
     }
 
     const uid = req.dbUser.id;
+    if (currentFriendlyRoomForUser(uid)) {
+      return res.status(409).json({
+        error: 'friendly_room_active',
+        message: '친선전 방을 먼저 나가주세요.',
+      });
+    }
     const existingMatch = currentMatchForUser(uid);
     if (existingMatch) return res.json(matchmakingStatus(uid));
 
@@ -708,6 +839,166 @@ app.get('/api/matchmaking/status', async (req, res) => {
 app.post('/api/matchmaking/leave', async (req, res) => {
   leaveMatchmaking(req.dbUser.id);
   return res.json({ ok: true, status: 'idle' });
+});
+
+// ── 친선전 대기실 ──
+app.post('/api/friendly/create', async (req, res) => {
+  try {
+    pruneStaleFriendlyRooms();
+    const snapshot = sanitizeDeckSnapshot(req.body?.deck, req.body?.deckShiny);
+    if (!snapshot) {
+      return res.status(400).json({
+        error: 'invalid_deck',
+        message: '친선전은 30장 덱이 필요합니다.',
+      });
+    }
+
+    const uid = req.dbUser.id;
+    if (currentMatchForUser(uid)) {
+      return res.status(409).json({ error: 'match_active', message: '진행 중인 온라인 배틀이 있습니다.' });
+    }
+
+    removeQueuedUser(uid);
+    leaveFriendlyRoom(uid);
+
+    const now = Date.now();
+    const code = generateFriendlyCode();
+    const room = {
+      code,
+      status: 'waiting',
+      createdAt: now,
+      lastActivityAt: now,
+      startedAt: null,
+      matchId: null,
+      host: {
+        uid,
+        username: req.dbUser.username,
+        ...snapshot,
+        ready: false,
+        joinedAt: now,
+        lastSeenAt: now,
+      },
+      guest: null,
+    };
+    friendlyRooms.set(code, room);
+    friendlyRoomByUser.set(uid, code);
+    return res.json(friendlyRoomPayload(room, uid));
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: 'server_error' });
+  }
+});
+
+app.post('/api/friendly/join', async (req, res) => {
+  try {
+    pruneStaleFriendlyRooms();
+    const code = String(req.body?.code || '').trim().toUpperCase();
+    if (!FRIENDLY_CODE_RE.test(code)) {
+      return res.status(400).json({ error: 'invalid_room_code', message: '6자리 방 코드를 확인해주세요.' });
+    }
+    const snapshot = sanitizeDeckSnapshot(req.body?.deck, req.body?.deckShiny);
+    if (!snapshot) {
+      return res.status(400).json({ error: 'invalid_deck', message: '친선전은 30장 덱이 필요합니다.' });
+    }
+
+    const uid = req.dbUser.id;
+    if (currentMatchForUser(uid)) {
+      return res.status(409).json({ error: 'match_active', message: '진행 중인 온라인 배틀이 있습니다.' });
+    }
+
+    const room = friendlyRooms.get(code);
+    if (!room || room.status !== 'waiting') {
+      return res.status(404).json({ error: 'room_not_found', message: '입장할 수 있는 친선전 방을 찾지 못했습니다.' });
+    }
+    if (room.host.uid === uid) {
+      friendlyRoomByUser.set(uid, room.code);
+      room.host.deck = snapshot.deck;
+      room.host.deckShiny = snapshot.deckShiny;
+      return res.json(friendlyRoomPayload(room, uid));
+    }
+    if (room.guest && room.guest.uid !== uid) {
+      return res.status(409).json({ error: 'room_full', message: '이미 두 명이 입장한 방입니다.' });
+    }
+
+    removeQueuedUser(uid);
+    const previous = currentFriendlyRoomForUser(uid);
+    if (previous && previous.code !== code) leaveFriendlyRoom(uid);
+
+    const now = Date.now();
+    room.guest = {
+      uid,
+      username: req.dbUser.username,
+      ...snapshot,
+      ready: false,
+      joinedAt: now,
+      lastSeenAt: now,
+    };
+    room.host.ready = false;
+    room.lastActivityAt = now;
+    friendlyRoomByUser.set(uid, code);
+    return res.json(friendlyRoomPayload(room, uid));
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: 'server_error' });
+  }
+});
+
+app.get('/api/friendly/room', async (req, res) => {
+  pruneStaleFriendlyRooms();
+  const uid = req.dbUser.id;
+  const room = currentFriendlyRoomForUser(uid);
+  if (!room) {
+    return res.status(404).json({ error: 'room_not_found', message: '친선전 방을 찾을 수 없습니다.' });
+  }
+  const payload = friendlyRoomPayload(room, uid);
+  if (room.status === 'started') {
+    friendlyRoomByUser.delete(uid);
+  }
+  return res.json(payload);
+});
+
+app.post('/api/friendly/ready', async (req, res) => {
+  const uid = req.dbUser.id;
+  const room = currentFriendlyRoomForUser(uid);
+  if (!room || room.status !== 'waiting') {
+    return res.status(404).json({ error: 'room_not_found', message: '친선전 대기실을 찾을 수 없습니다.' });
+  }
+  const participant = friendlyParticipant(room, uid);
+  participant.ready = req.body?.ready === true;
+  room.lastActivityAt = Date.now();
+  return res.json(friendlyRoomPayload(room, uid));
+});
+
+app.post('/api/friendly/start', async (req, res) => {
+  const uid = req.dbUser.id;
+  const room = currentFriendlyRoomForUser(uid);
+  if (!room || room.status !== 'waiting') {
+    return res.status(404).json({ error: 'room_not_found', message: '친선전 대기실을 찾을 수 없습니다.' });
+  }
+  if (room.host.uid !== uid) {
+    return res.status(403).json({ error: 'host_only', message: '방장만 게임을 시작할 수 있습니다.' });
+  }
+  if (!room.guest) {
+    return res.status(409).json({ error: 'opponent_missing', message: '상대의 입장을 기다려주세요.' });
+  }
+  if (!room.host.ready || !room.guest.ready) {
+    return res.status(409).json({ error: 'players_not_ready', message: '두 플레이어 모두 준비해야 합니다.' });
+  }
+
+  const match = createMatch(room.host, room.guest);
+  room.status = 'started';
+  room.matchId = match.id;
+  room.startedAt = Date.now();
+  room.lastActivityAt = room.startedAt;
+
+  const payload = friendlyRoomPayload(room, uid);
+  friendlyRoomByUser.delete(uid);
+  return res.json(payload);
+});
+
+app.post('/api/friendly/leave', async (req, res) => {
+  leaveFriendlyRoom(req.dbUser.id);
+  return res.json({ ok: true });
 });
 
 // ── 온라인 배틀방 ──
