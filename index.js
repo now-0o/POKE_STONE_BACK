@@ -36,7 +36,7 @@ const ONLINE_COMMAND_TYPES = new Set([
   'surrender',
 ]);
 
-// 안정성 테스트 단계의 랜덤 매칭/전투방은 단일 EC2 프로세스 메모리에서 관리한다.
+// 랜덤 매칭/전투방은 단일 EC2 프로세스 메모리에서 관리한다.
 // 서버 재시작 시 큐/매치는 초기화된다. 이후 Redis + 서버 권위 엔진으로 이전할 수 있게
 // command/stateRevision 프로토콜을 분리해 둔다.
 const matchmakingQueue = [];
@@ -63,16 +63,13 @@ function auth(req, res, next) {
   }
 }
 
-async function adminOnly(req, res, next) {
+async function onlineUser(req, res, next) {
   try {
     const user = await User.findByPk(req.user.uid, {
-      attributes: ['id', 'username', 'isAdmin'],
+      attributes: ['id', 'username'],
     });
-    if (!user || !user.isAdmin) {
-      return res.status(403).json({
-        error: 'admin_only',
-        message: '온라인 배틀은 안정성 테스트 중입니다. 관리자 계정만 이용할 수 있습니다.',
-      });
+    if (!user) {
+      return res.status(401).json({ error: 'invalid_token' });
     }
     req.dbUser = user;
     next();
@@ -542,7 +539,7 @@ app.put('/api/save', auth, async (req, res) => {
   }
 });
 
-app.post('/api/matchmaking/join', auth, adminOnly, async (req, res) => {
+app.post('/api/matchmaking/join', auth, onlineUser, async (req, res) => {
   try {
     pruneStaleQueue();
     const snapshot = sanitizeDeckSnapshot(req.body?.deck, req.body?.deckShiny);
@@ -592,18 +589,18 @@ app.post('/api/matchmaking/join', auth, adminOnly, async (req, res) => {
   }
 });
 
-app.get('/api/matchmaking/status', auth, adminOnly, async (req, res) => {
+app.get('/api/matchmaking/status', auth, onlineUser, async (req, res) => {
   pruneStaleQueue();
   return res.json(matchmakingStatus(req.dbUser.id));
 });
 
-app.post('/api/matchmaking/leave', auth, adminOnly, async (req, res) => {
+app.post('/api/matchmaking/leave', auth, onlineUser, async (req, res) => {
   leaveMatchmaking(req.dbUser.id);
   return res.json({ ok: true, status: 'idle' });
 });
 
-// ── 관리자 테스트용 온라인 배틀방 ──
-app.get('/api/online/match/:matchId/bootstrap', auth, adminOnly, async (req, res) => {
+// ── 온라인 배틀방 ──
+app.get('/api/online/match/:matchId/bootstrap', auth, onlineUser, async (req, res) => {
   const match = matchFromRequest(req, res);
   if (!match) return;
   const uid = req.dbUser.id;
@@ -639,7 +636,7 @@ app.get('/api/online/match/:matchId/bootstrap', auth, adminOnly, async (req, res
   });
 });
 
-app.post('/api/online/match/:matchId/initialize', auth, adminOnly, async (req, res) => {
+app.post('/api/online/match/:matchId/initialize', auth, onlineUser, async (req, res) => {
   const match = matchFromRequest(req, res);
   if (!match) return;
   if (match.hostUid !== req.dbUser.id) {
@@ -660,13 +657,13 @@ app.post('/api/online/match/:matchId/initialize', auth, adminOnly, async (req, r
   return res.json(roomStatePayload(match, req.dbUser.id));
 });
 
-app.get('/api/online/match/:matchId/state', auth, adminOnly, async (req, res) => {
+app.get('/api/online/match/:matchId/state', auth, onlineUser, async (req, res) => {
   const match = matchFromRequest(req, res);
   if (!match) return;
   return res.json(roomStatePayload(match, req.dbUser.id));
 });
 
-app.get('/api/online/match/:matchId/host', auth, adminOnly, async (req, res) => {
+app.get('/api/online/match/:matchId/host', auth, onlineUser, async (req, res) => {
   const match = matchFromRequest(req, res);
   if (!match) return;
   if (match.hostUid !== req.dbUser.id) {
@@ -680,7 +677,7 @@ app.get('/api/online/match/:matchId/host', auth, adminOnly, async (req, res) => 
   });
 });
 
-app.post('/api/online/match/:matchId/command', auth, adminOnly, async (req, res) => {
+app.post('/api/online/match/:matchId/command', auth, onlineUser, async (req, res) => {
   const match = matchFromRequest(req, res);
   if (!match) return;
   const uid = req.dbUser.id;
@@ -727,7 +724,7 @@ app.post('/api/online/match/:matchId/command', auth, adminOnly, async (req, res)
   return res.json({ ok: true, commandId: id, revision: match.stateRevision });
 });
 
-app.post('/api/online/match/:matchId/host/commit', auth, adminOnly, async (req, res) => {
+app.post('/api/online/match/:matchId/host/commit', auth, onlineUser, async (req, res) => {
   const match = matchFromRequest(req, res);
   if (!match) return;
   if (match.hostUid !== req.dbUser.id) {
