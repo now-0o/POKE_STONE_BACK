@@ -27,10 +27,12 @@ const USERNAME_RE = /^[a-zA-Z0-9_]{3,20}$/;
 const CARD_ID_RE = /^[a-zA-Z0-9_-]{1,64}$/;
 const FRIENDLY_CODE_RE = /^[A-Z2-9]{6}$/;
 const FRIENDLY_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+const FRIENDLY_ROOM_NAME_MAX = 28;
+const FRIENDLY_PASSWORD_MAX = 32;
 const MATCHMAKING_IDLE_MS = 60_000;
 const FRIENDLY_ROOM_IDLE_MS = 10 * 60_000;
 const FRIENDLY_GUEST_IDLE_MS = 90_000;
-const FRIENDLY_STARTED_KEEP_MS = 2 * 60_000;
+const FRIENDLY_RETURN_WAIT_MS = 3 * 60_000;
 const ONLINE_PLAYER_IDLE_MS = 90_000;
 const ONLINE_RATE_REFILL_PER_SECOND = 35;
 const ONLINE_RATE_BURST = 70;
@@ -183,6 +185,21 @@ function sanitizeDeckSnapshot(deck, deckShiny = {}) {
   return { deck: [...deck], deckShiny: shiny };
 }
 
+function sanitizeFriendlyRoomName(rawName, username) {
+  const name = String(rawName || '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, FRIENDLY_ROOM_NAME_MAX);
+  return name || `${username}의 방`;
+}
+
+function sanitizeDeckName(rawName) {
+  return String(rawName || '선택 덱')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 24) || '선택 덱';
+}
+
 function removeQueuedUser(uid) {
   const index = matchmakingQueue.findIndex((entry) => entry.uid === uid);
   if (index >= 0) matchmakingQueue.splice(index, 1);
@@ -238,11 +255,19 @@ function destroyFriendlyRoom(room) {
 
 function leaveFriendlyRoom(uid) {
   const room = currentFriendlyRoomForUser(uid);
-  if (!room) return;
+  if (!room) return { ok: true };
+
+  if (room.status === 'playing') {
+    return {
+      ok: false,
+      error: 'battle_active',
+      message: '배틀 중에는 친선전 방에서 나갈 수 없습니다.',
+    };
+  }
 
   if (room.host?.uid === uid) {
     destroyFriendlyRoom(room);
-    return;
+    return { ok: true };
   }
 
   if (room.guest?.uid === uid) {
@@ -250,8 +275,12 @@ function leaveFriendlyRoom(uid) {
     room.guest = null;
     room.host.ready = false;
     room.status = 'waiting';
+    room.matchId = null;
+    room.returningAt = null;
     room.lastActivityAt = Date.now();
   }
+
+  return { ok: true };
 }
 
 function friendlyRoomPayload(room, uid) {
@@ -262,18 +291,26 @@ function friendlyRoomPayload(room, uid) {
   me.lastSeenAt = now;
   room.lastActivityAt = now;
 
+  const battleInProgress = room.status === 'playing' || room.status === 'returning';
+
   return {
     status: room.status,
-    code: room.code,
+    roomId: room.code,
+    name: room.name,
+    isPrivate: !!room.isPrivate,
     host: room.host.uid === uid,
     me: {
       username: me.username,
       ready: !!me.ready,
+      deckName: me.deckName || '선택 덱',
+      returned: !!me.returned,
     },
     opponent: opponent
       ? {
           username: opponent.username,
           ready: !!opponent.ready,
+          deckName: opponent.deckName || '선택 덱',
+          returned: !!opponent.returned,
         }
       : null,
     canStart:
@@ -281,16 +318,58 @@ function friendlyRoomPayload(room, uid) {
       !!room.host.ready &&
       !!room.guest?.ready &&
       room.status === 'waiting',
-    matchId: room.status === 'started' ? room.matchId : null,
+    canEditDeck: room.status === 'waiting',
+    matchId: battleInProgress && !me.returned ? room.matchId : null,
   };
+}
+
+function friendlyRoomListPayload() {
+  return [...friendlyRooms.values()]
+    .filter((room) => room.status === 'waiting')
+    .sort((a, b) => b.createdAt - a.createdAt)
+    .slice(0, 50)
+    .map((room) => ({
+      roomId: room.code,
+      name: room.name,
+      host: room.host.username,
+      isPrivate: !!room.isPrivate,
+      players: room.guest ? 2 : 1,
+      full: !!room.guest,
+      createdAt: room.createdAt,
+    }));
+}
+
+function resetFriendlyRoomAfterBattle(room, match = null) {
+  if (!room) return;
+  room.status = 'waiting';
+  room.matchId = null;
+  room.startedAt = null;
+  room.returningAt = null;
+  room.lastActivityAt = Date.now();
+  for (const participant of [room.host, room.guest]) {
+    if (!participant) continue;
+    participant.ready = false;
+    participant.returned = false;
+    participant.lastSeenAt = Date.now();
+  }
+  if (match) destroyMatch(match);
 }
 
 function pruneStaleFriendlyRooms() {
   const now = Date.now();
   for (const room of friendlyRooms.values()) {
-    if (room.status === 'started') {
-      if (now - (room.startedAt || room.lastActivityAt || 0) > FRIENDLY_STARTED_KEEP_MS) {
-        destroyFriendlyRoom(room);
+    if (room.status === 'playing' || room.status === 'returning') {
+      const match = room.matchId ? activeMatches.get(room.matchId) : null;
+      if (!match) {
+        resetFriendlyRoomAfterBattle(room);
+        continue;
+      }
+      if (
+        room.status === 'returning' &&
+        room.returningAt &&
+        now - room.returningAt > FRIENDLY_RETURN_WAIT_MS
+      ) {
+        resetFriendlyRoomAfterBattle(room, match);
       }
       continue;
     }
@@ -399,7 +478,7 @@ function matchmakingStatus(uid) {
   return { status: 'idle' };
 }
 
-function createMatch(firstEntry, secondEntry) {
+function createMatch(firstEntry, secondEntry, options = {}) {
   const id = crypto.randomUUID();
   const firstUid = Math.random() < 0.5 ? firstEntry.uid : secondEntry.uid;
   const now = Date.now();
@@ -413,6 +492,7 @@ function createMatch(firstEntry, secondEntry) {
     lastActivityAt: now,
     firstUid,
     hostUid: players[0].uid,
+    friendlyRoomId: options.friendlyRoomId || null,
     seed: crypto.randomBytes(12).toString('hex'),
     players,
     phase: 'waiting_host',
@@ -841,7 +921,12 @@ app.post('/api/matchmaking/leave', async (req, res) => {
   return res.json({ ok: true, status: 'idle' });
 });
 
-// ── 친선전 대기실 ──
+// ── 친선전 방 목록 / 대기실 ──
+app.get('/api/friendly/rooms', async (req, res) => {
+  pruneStaleFriendlyRooms();
+  return res.json({ rooms: friendlyRoomListPayload() });
+});
+
 app.post('/api/friendly/create', async (req, res) => {
   try {
     pruneStaleFriendlyRooms();
@@ -858,23 +943,42 @@ app.post('/api/friendly/create', async (req, res) => {
       return res.status(409).json({ error: 'match_active', message: '진행 중인 온라인 배틀이 있습니다.' });
     }
 
+    const isPrivate = req.body?.isPrivate === true;
+    const password = String(req.body?.password || '');
+    if (isPrivate && (password.length < 4 || password.length > FRIENDLY_PASSWORD_MAX)) {
+      return res.status(400).json({
+        error: 'invalid_room_password',
+        message: '비밀방 비밀번호는 4~32자로 설정해주세요.',
+      });
+    }
+
     removeQueuedUser(uid);
+    const previous = currentFriendlyRoomForUser(uid);
+    if (previous?.status === 'playing') {
+      return res.status(409).json({ error: 'battle_active', message: '진행 중인 친선전이 있습니다.' });
+    }
     leaveFriendlyRoom(uid);
 
     const now = Date.now();
     const code = generateFriendlyCode();
     const room = {
       code,
+      name: sanitizeFriendlyRoomName(req.body?.name, req.dbUser.username),
+      isPrivate,
+      passwordHash: isPrivate ? await bcrypt.hash(password, 8) : null,
       status: 'waiting',
       createdAt: now,
       lastActivityAt: now,
       startedAt: null,
+      returningAt: null,
       matchId: null,
       host: {
         uid,
         username: req.dbUser.username,
         ...snapshot,
+        deckName: sanitizeDeckName(req.body?.deckName),
         ready: false,
+        returned: false,
         joinedAt: now,
         lastSeenAt: now,
       },
@@ -892,9 +996,9 @@ app.post('/api/friendly/create', async (req, res) => {
 app.post('/api/friendly/join', async (req, res) => {
   try {
     pruneStaleFriendlyRooms();
-    const code = String(req.body?.code || '').trim().toUpperCase();
-    if (!FRIENDLY_CODE_RE.test(code)) {
-      return res.status(400).json({ error: 'invalid_room_code', message: '6자리 방 코드를 확인해주세요.' });
+    const roomId = String(req.body?.roomId || '').trim().toUpperCase();
+    if (!FRIENDLY_CODE_RE.test(roomId)) {
+      return res.status(400).json({ error: 'invalid_room', message: '친선전 방 정보가 올바르지 않습니다.' });
     }
     const snapshot = sanitizeDeckSnapshot(req.body?.deck, req.body?.deckShiny);
     if (!snapshot) {
@@ -906,14 +1010,27 @@ app.post('/api/friendly/join', async (req, res) => {
       return res.status(409).json({ error: 'match_active', message: '진행 중인 온라인 배틀이 있습니다.' });
     }
 
-    const room = friendlyRooms.get(code);
+    const room = friendlyRooms.get(roomId);
     if (!room || room.status !== 'waiting') {
       return res.status(404).json({ error: 'room_not_found', message: '입장할 수 있는 친선전 방을 찾지 못했습니다.' });
     }
+
+    if (room.isPrivate) {
+      const password = String(req.body?.password || '');
+      const passwordOk = room.passwordHash
+        ? await bcrypt.compare(password, room.passwordHash)
+        : false;
+      if (!passwordOk) {
+        return res.status(403).json({ error: 'wrong_room_password', message: '방 비밀번호가 올바르지 않습니다.' });
+      }
+    }
+
     if (room.host.uid === uid) {
       friendlyRoomByUser.set(uid, room.code);
       room.host.deck = snapshot.deck;
       room.host.deckShiny = snapshot.deckShiny;
+      room.host.deckName = sanitizeDeckName(req.body?.deckName);
+      room.host.ready = false;
       return res.json(friendlyRoomPayload(room, uid));
     }
     if (room.guest && room.guest.uid !== uid) {
@@ -922,20 +1039,27 @@ app.post('/api/friendly/join', async (req, res) => {
 
     removeQueuedUser(uid);
     const previous = currentFriendlyRoomForUser(uid);
-    if (previous && previous.code !== code) leaveFriendlyRoom(uid);
+    if (previous && previous.code !== roomId) {
+      if (previous.status === 'playing') {
+        return res.status(409).json({ error: 'battle_active', message: '진행 중인 친선전이 있습니다.' });
+      }
+      leaveFriendlyRoom(uid);
+    }
 
     const now = Date.now();
     room.guest = {
       uid,
       username: req.dbUser.username,
       ...snapshot,
+      deckName: sanitizeDeckName(req.body?.deckName),
       ready: false,
+      returned: false,
       joinedAt: now,
       lastSeenAt: now,
     };
     room.host.ready = false;
     room.lastActivityAt = now;
-    friendlyRoomByUser.set(uid, code);
+    friendlyRoomByUser.set(uid, roomId);
     return res.json(friendlyRoomPayload(room, uid));
   } catch (e) {
     console.error(e);
@@ -950,18 +1074,33 @@ app.get('/api/friendly/room', async (req, res) => {
   if (!room) {
     return res.status(404).json({ error: 'room_not_found', message: '친선전 방을 찾을 수 없습니다.' });
   }
-  const payload = friendlyRoomPayload(room, uid);
-  if (room.status === 'started') {
-    friendlyRoomByUser.delete(uid);
+  return res.json(friendlyRoomPayload(room, uid));
+});
+
+app.post('/api/friendly/deck', async (req, res) => {
+  const uid = req.dbUser.id;
+  const room = currentFriendlyRoomForUser(uid);
+  if (!room || room.status !== 'waiting') {
+    return res.status(409).json({ error: 'room_not_ready', message: '대기실에서만 덱을 변경할 수 있습니다.' });
   }
-  return res.json(payload);
+  const snapshot = sanitizeDeckSnapshot(req.body?.deck, req.body?.deckShiny);
+  if (!snapshot) {
+    return res.status(400).json({ error: 'invalid_deck', message: '30장으로 완성된 덱을 선택해주세요.' });
+  }
+  const participant = friendlyParticipant(room, uid);
+  participant.deck = snapshot.deck;
+  participant.deckShiny = snapshot.deckShiny;
+  participant.deckName = sanitizeDeckName(req.body?.deckName);
+  participant.ready = false;
+  room.lastActivityAt = Date.now();
+  return res.json(friendlyRoomPayload(room, uid));
 });
 
 app.post('/api/friendly/ready', async (req, res) => {
   const uid = req.dbUser.id;
   const room = currentFriendlyRoomForUser(uid);
   if (!room || room.status !== 'waiting') {
-    return res.status(404).json({ error: 'room_not_found', message: '친선전 대기실을 찾을 수 없습니다.' });
+    return res.status(409).json({ error: 'room_not_ready', message: '아직 다음 배틀을 준비할 수 없습니다.' });
   }
   const participant = friendlyParticipant(room, uid);
   participant.ready = req.body?.ready === true;
@@ -973,7 +1112,7 @@ app.post('/api/friendly/start', async (req, res) => {
   const uid = req.dbUser.id;
   const room = currentFriendlyRoomForUser(uid);
   if (!room || room.status !== 'waiting') {
-    return res.status(404).json({ error: 'room_not_found', message: '친선전 대기실을 찾을 수 없습니다.' });
+    return res.status(409).json({ error: 'room_not_ready', message: '친선전 대기실이 준비되지 않았습니다.' });
   }
   if (room.host.uid !== uid) {
     return res.status(403).json({ error: 'host_only', message: '방장만 게임을 시작할 수 있습니다.' });
@@ -985,19 +1124,59 @@ app.post('/api/friendly/start', async (req, res) => {
     return res.status(409).json({ error: 'players_not_ready', message: '두 플레이어 모두 준비해야 합니다.' });
   }
 
-  const match = createMatch(room.host, room.guest);
-  room.status = 'started';
+  room.host.returned = false;
+  room.guest.returned = false;
+  const match = createMatch(room.host, room.guest, { friendlyRoomId: room.code });
+  room.status = 'playing';
   room.matchId = match.id;
   room.startedAt = Date.now();
+  room.returningAt = null;
   room.lastActivityAt = room.startedAt;
 
-  const payload = friendlyRoomPayload(room, uid);
-  friendlyRoomByUser.delete(uid);
-  return res.json(payload);
+  return res.json(friendlyRoomPayload(room, uid));
+});
+
+app.post('/api/friendly/return', async (req, res) => {
+  const uid = req.dbUser.id;
+  const room = currentFriendlyRoomForUser(uid);
+  if (!room || !['playing', 'returning'].includes(room.status)) {
+    return res.status(404).json({ error: 'room_not_found', message: '돌아갈 친선전 방을 찾을 수 없습니다.' });
+  }
+
+  const requestedMatchId = String(req.body?.matchId || '');
+  if (!requestedMatchId || requestedMatchId !== room.matchId) {
+    return res.status(409).json({ error: 'match_mismatch', message: '친선전 배틀 정보가 일치하지 않습니다.' });
+  }
+
+  const match = activeMatches.get(room.matchId);
+  if (match && match.phase !== 'finished' && !match.state?.winner) {
+    return res.status(409).json({ error: 'match_not_finished', message: '아직 배틀이 종료되지 않았습니다.' });
+  }
+
+  const participant = friendlyParticipant(room, uid);
+  participant.returned = true;
+  participant.ready = false;
+  participant.lastSeenAt = Date.now();
+
+  const everyoneReturned =
+    !!room.host?.returned && (!room.guest || !!room.guest.returned);
+
+  if (everyoneReturned) {
+    resetFriendlyRoomAfterBattle(room, match);
+  } else {
+    room.status = 'returning';
+    room.returningAt = room.returningAt || Date.now();
+    room.lastActivityAt = Date.now();
+  }
+
+  return res.json(friendlyRoomPayload(room, uid));
 });
 
 app.post('/api/friendly/leave', async (req, res) => {
-  leaveFriendlyRoom(req.dbUser.id);
+  const result = leaveFriendlyRoom(req.dbUser.id);
+  if (!result.ok) {
+    return res.status(409).json({ error: result.error, message: result.message });
+  }
   return res.json({ ok: true });
 });
 
